@@ -1,18 +1,20 @@
 """Self-contained Colab trainer for the melody->chord accompanist (POP909).
 
 Runs entirely in Colab (or any GPU box) with NO local install and NO access to the
-private app repo — everything it needs is in this one file. It downloads POP909, parses
-each song into per-beat (melody pitch-class, chord), trains the streaming ChordGPT, and
-saves a checkpoint.
+private app repo. Downloads POP909, parses each song into per-beat (melody pitch-class,
+chord), trains the streaming ChordGPT, and saves a checkpoint.
 
-USAGE IN COLAB
-  1) New notebook, Runtime -> Change runtime type -> GPU (T4 is plenty).
-  2) Upload this file (or paste it into a cell).
-  3) Run:
-        !pip -q install pretty_midi
-        !git clone -q https://github.com/music-x-lab/POP909-Dataset.git
-        !python colab_pop909.py --pop909 POP909-Dataset/POP909 --epochs 30
-  4) Download training_chordgpt.pt when done.
+v2 improvements (higher accuracy):
+  * Transposition augmentation: each example is randomly transposed to one of 12 keys
+    on the fly -> the model becomes key-invariant and effectively sees ~12x the data.
+    (Validation uses the original key, so the metric stays honest.)
+  * Longer context (more beats), a bigger model, more epochs, and a one-cycle LR schedule.
+
+USAGE IN COLAB (Runtime -> change runtime type -> T4 GPU):
+    !pip -q install pretty_midi
+    !git clone -q https://github.com/music-x-lab/POP909-Dataset.git
+    !wget -q https://raw.githubusercontent.com/420755/AI-Accompanist-releases/main/colab_pop909.py
+    !python colab_pop909.py --pop909 POP909-Dataset/POP909 --epochs 40
 
 Self-test without data:  python colab_pop909.py --synthetic
 """
@@ -20,9 +22,7 @@ Self-test without data:  python colab_pop909.py --synthetic
 from __future__ import annotations
 
 import argparse
-import glob
-import math
-import os
+import random
 from pathlib import Path
 
 import torch
@@ -47,10 +47,12 @@ def chord_tok(root, q): return CH_NC if root is None else CH_BASE + (root % 12) 
 def is_chord(t): return t == CH_NC or t >= CH_BASE
 
 
-def interleave_targets(melody, chords):
+def encode(melody, chords, shift=0):
+    """Interleave [BOS,m1,c1,...] transposed by `shift` semitones; score chord targets."""
     seq = [BOS]
     for pc, (r, q) in zip(melody, chords):
-        seq += [mel_tok(pc), chord_tok(r, q)]
+        seq.append(mel_tok(None if pc is None else (pc + shift) % 12))
+        seq.append(chord_tok(None if r is None else (r + shift) % 12, q))
     inp = seq[:-1]
     tgt = [t if is_chord(t) else IGNORE for t in seq[1:]]
     return inp, tgt
@@ -58,7 +60,6 @@ def interleave_targets(melody, chords):
 
 # ---------------------------------------------------------------- POP909 parsing
 def _parse_chord_label(label: str):
-    """'C:maj' / 'A:min7' / 'N' -> (root_pc, 'maj'|'min') or (None, 'maj')."""
     label = label.strip()
     if not label or label.upper().startswith("N"):
         return (None, "maj")
@@ -84,9 +85,7 @@ def _read_chord_spans(path: Path):
 
 
 def parse_song(folder: Path):
-    """One POP909 song folder -> (melody_pcs, chords) per beat, or None on failure."""
     import pretty_midi
-
     mids = list(folder.glob("*.mid"))
     chord_file = folder / "chord_midi.txt"
     if not mids or not chord_file.exists():
@@ -95,7 +94,6 @@ def parse_song(folder: Path):
         pm = pretty_midi.PrettyMIDI(str(mids[0]))
     except Exception:
         return None
-
     melody = next((i for i in pm.instruments if i.name.strip().upper() == "MELODY"), None)
     if melody is None or not melody.notes:
         return None
@@ -103,53 +101,57 @@ def parse_song(folder: Path):
     if len(beats) < 8:
         return None
     spans = _read_chord_spans(chord_file)
-
     melody_pcs, chords = [], []
     for bt in beats:
-        # melody pitch class sounding at this beat (highest note wins).
         active = [n for n in melody.notes if n.start <= bt + 1e-3 < n.end]
         melody_pcs.append(max(active, key=lambda n: n.pitch).pitch % 12 if active else None)
-        # chord active at this beat.
-        ch = next(((r, q) for (s, e, r, q) in spans if s <= bt < e), (None, "maj"))
-        chords.append(ch)
+        chords.append(next(((r, q) for (s, e, r, q) in spans if s <= bt < e), (None, "maj")))
     return melody_pcs, chords
 
 
-def chunk(melody, chords, seq_beats=16, hop=8):
-    for i in range(0, max(1, len(melody) - seq_beats + 1), hop):
-        m, c = melody[i:i + seq_beats], chords[i:i + seq_beats]
-        if len(m) >= 4 and any(pc is not None for pc in m):
-            yield interleave_targets(m, c)
+def raw_chunks(root, seq_beats, hop):
+    """All per-song beat sequences -> list of raw (melody, chords) chunks."""
+    folders = sorted(p for p in Path(root).iterdir() if p.is_dir())
+    chunks = []
+    for i, folder in enumerate(folders):
+        song = parse_song(folder)
+        if song:
+            mel, ch = song
+            for s in range(0, max(1, len(mel) - seq_beats + 1), hop):
+                m, c = mel[s:s + seq_beats], ch[s:s + seq_beats]
+                if len(m) >= 8 and any(pc is not None for pc in m):
+                    chunks.append((m, c))
+        if (i + 1) % 150 == 0:
+            print(f"  parsed {i+1}/{len(folders)} songs, {len(chunks)} chunks")
+    print(f"POP909: {len(chunks)} chunks from {len(folders)} songs")
+    return chunks
 
 
-class POP909(Dataset):
-    def __init__(self, root, seq_beats=16):
-        self.items = []
-        folders = sorted(p for p in Path(root).iterdir() if p.is_dir())
-        for i, folder in enumerate(folders):
-            song = parse_song(folder)
-            if song:
-                self.items.extend(chunk(*song, seq_beats=seq_beats))
-            if (i + 1) % 100 == 0:
-                print(f"  parsed {i+1}/{len(folders)} songs, {len(self.items)} examples")
-        print(f"POP909: {len(self.items)} training examples from {len(folders)} songs")
+class ChunkData(Dataset):
+    """Raw (melody, chords) chunks; transposed to a random key when augment=True."""
+    def __init__(self, chunks, augment=True):
+        self.chunks = chunks
+        self.augment = augment
 
-    def __len__(self): return len(self.items)
+    def __len__(self): return len(self.chunks)
+
     def __getitem__(self, i):
-        inp, tgt = self.items[i]
+        mel, ch = self.chunks[i]
+        shift = random.randint(0, 11) if self.augment else 0
+        inp, tgt = encode(mel, ch, shift)
         return torch.tensor(inp), torch.tensor(tgt)
 
 
 class Synthetic(Dataset):
-    def __init__(self, n=1500, seq_beats=16):
+    def __init__(self, n=1500, seq_beats=24):
         scale = [0, 2, 4, 5, 7, 9, 11]
         rule = {0: (0, "maj"), 2: (7, "maj"), 4: (0, "maj"), 5: (5, "maj"),
                 7: (0, "maj"), 9: (5, "min"), 11: (7, "maj")}
-        g = torch.Generator().manual_seed(0)
+        g = random.Random(0)
         self.items = []
         for _ in range(n):
-            m = [scale[int(torch.randint(7, (1,), generator=g))] for _ in range(seq_beats)]
-            self.items.append(interleave_targets(m, [rule[pc] for pc in m]))
+            m = [g.choice(scale) for _ in range(seq_beats)]
+            self.items.append(encode(m, [rule[pc] for pc in m]))
 
     def __len__(self): return len(self.items)
     def __getitem__(self, i):
@@ -166,7 +168,7 @@ def collate(batch):
 
 # ---------------------------------------------------------------- model
 class ChordGPT(nn.Module):
-    def __init__(self, vocab=VOCAB, block=64, n_layer=6, n_head=4, n_embd=256, drop=0.1):
+    def __init__(self, vocab=VOCAB, block=96, n_layer=6, n_head=8, n_embd=320, drop=0.1):
         super().__init__()
         self.block = block
         self.tok = nn.Embedding(vocab, n_embd)
@@ -207,37 +209,54 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pop909", default="")
     ap.add_argument("--synthetic", action="store_true")
-    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch", type=int, default=128)
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--seq-beats", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=6e-4)
+    ap.add_argument("--seq-beats", type=int, default=24)
+    ap.add_argument("--hop", type=int, default=12)
+    ap.add_argument("--n-layer", type=int, default=6)
+    ap.add_argument("--n-embd", type=int, default=320)
+    ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--out", default="training_chordgpt.pt")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     if a.synthetic or not a.pop909:
         ds = Synthetic(seq_beats=a.seq_beats)
+        nval = max(1, len(ds) // 10)
+        tr, va = torch.utils.data.random_split(ds, [len(ds) - nval, nval])
     else:
-        ds = POP909(a.pop909, seq_beats=a.seq_beats)
-    nval = max(1, len(ds) // 10)
-    tr, va = torch.utils.data.random_split(ds, [len(ds) - nval, nval])
-    tdl = DataLoader(tr, a.batch, shuffle=True, collate_fn=collate)
+        chunks = raw_chunks(a.pop909, a.seq_beats, a.hop)
+        random.Random(0).shuffle(chunks)
+        nval = max(1, len(chunks) // 10)
+        va = ChunkData(chunks[:nval], augment=False)             # honest val: original key
+        tr = ChunkData(chunks[nval:], augment=not a.no_augment)  # key-augmented train
+
+    tdl = DataLoader(tr, a.batch, shuffle=True, collate_fn=collate, drop_last=True)
     vdl = DataLoader(va, a.batch, collate_fn=collate)
 
-    model = ChordGPT(block=2 * a.seq_beats + 2).to(dev)
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr)
+    model = ChordGPT(block=2 * a.seq_beats + 2, n_layer=a.n_layer, n_embd=a.n_embd).to(dev)
+    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.01)
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=a.lr, epochs=a.epochs, steps_per_epoch=len(tdl), pct_start=0.1)
     print(f"device={dev} params={sum(p.numel() for p in model.parameters()):,} "
-          f"train={len(tr)} val={len(va)}")
+          f"train={len(tr)} val={len(va)} augment={not a.no_augment}")
+
+    best = 0.0
     for ep in range(a.epochs):
         model.train(); run = 0.0
         for x, t in tdl:
             x, t = x.to(dev), t.to(dev)
             _, loss = model(x, t)
-            opt.zero_grad(); loss.backward(); opt.step(); run += loss.item()
-        print(f"epoch {ep+1}/{a.epochs} loss={run/len(tdl):.3f} "
-              f"val_chord_acc={chord_acc(model, vdl, dev):.3f}")
-    torch.save({"model": model.state_dict(), "vocab": VOCAB, "seq_beats": a.seq_beats}, a.out)
-    print(f"saved -> {a.out}")
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step(); sched.step(); run += loss.item()
+        acc = chord_acc(model, vdl, dev)
+        best = max(best, acc)
+        print(f"epoch {ep+1}/{a.epochs} loss={run/len(tdl):.3f} val_chord_acc={acc:.3f}")
+    torch.save({"model": model.state_dict(), "vocab": VOCAB, "seq_beats": a.seq_beats,
+                "n_layer": a.n_layer, "n_embd": a.n_embd}, a.out)
+    print(f"best_val_chord_acc={best:.3f}  saved -> {a.out}")
 
 
 if __name__ == "__main__":
