@@ -109,14 +109,48 @@ def parse_song(folder: Path):
     return melody_pcs, chords
 
 
-def raw_chunks(root, seq_beats, hop):
-    """All per-song beat sequences -> list of raw (melody, chords) chunks."""
+# Krumhansl-Schmuckler key profiles for tonic estimation (used to normalize key).
+_KS_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+_KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+
+
+def estimate_tonic(melody, chords):
+    """Estimate the song's tonic pitch class (chords weighted heavily)."""
+    hist = [0.0] * 12
+    for pc in melody:
+        if pc is not None:
+            hist[pc] += 1.0
+    for r, _q in chords:
+        if r is not None:
+            hist[r] += 2.0
+    best_score, best_tonic = -1e9, 0
+    for prof in (_KS_MAJOR, _KS_MINOR):
+        for tonic in range(12):
+            score = sum(hist[pc] * prof[(pc - tonic) % 12] for pc in range(12))
+            if score > best_score:
+                best_score, best_tonic = score, tonic
+    return best_tonic
+
+
+def _shift(melody, chords, k):
+    mel = [None if pc is None else (pc + k) % 12 for pc in melody]
+    ch = [(None if r is None else (r + k) % 12, q) for r, q in chords]
+    return mel, ch
+
+
+def raw_chunks(root, seq_beats, hop, normalize=True):
+    """All per-song beat sequences -> list of raw (melody, chords) chunks.
+
+    With normalize=True, each song is transposed so its tonic -> C (pitch class 0),
+    so the model learns harmony in ONE canonical key (the project's relative idea)."""
     folders = sorted(p for p in Path(root).iterdir() if p.is_dir())
     chunks = []
     for i, folder in enumerate(folders):
         song = parse_song(folder)
         if song:
             mel, ch = song
+            if normalize:
+                mel, ch = _shift(mel, ch, -estimate_tonic(mel, ch))
             for s in range(0, max(1, len(mel) - seq_beats + 1), hop):
                 m, c = mel[s:s + seq_beats], ch[s:s + seq_beats]
                 if len(m) >= 8 and any(pc is not None for pc in m):
@@ -128,16 +162,16 @@ def raw_chunks(root, seq_beats, hop):
 
 
 class ChunkData(Dataset):
-    """Raw (melody, chords) chunks; transposed to a random key when augment=True."""
-    def __init__(self, chunks, augment=True):
+    """Raw (key-normalized) chunks; small +/- aug_range transposition for robustness."""
+    def __init__(self, chunks, aug_range=2):
         self.chunks = chunks
-        self.augment = augment
+        self.aug_range = aug_range
 
     def __len__(self): return len(self.chunks)
 
     def __getitem__(self, i):
         mel, ch = self.chunks[i]
-        shift = random.randint(0, 11) if self.augment else 0
+        shift = random.randint(-self.aug_range, self.aug_range) if self.aug_range else 0
         inp, tgt = encode(mel, ch, shift)
         return torch.tensor(inp), torch.tensor(tgt)
 
@@ -216,7 +250,8 @@ def main():
     ap.add_argument("--hop", type=int, default=12)
     ap.add_argument("--n-layer", type=int, default=6)
     ap.add_argument("--n-embd", type=int, default=320)
-    ap.add_argument("--no-augment", action="store_true")
+    ap.add_argument("--aug-range", type=int, default=2, help="+/- semitones of light augmentation")
+    ap.add_argument("--no-normalize", action="store_true", help="disable key normalization")
     ap.add_argument("--out", default="training_chordgpt.pt")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -226,11 +261,11 @@ def main():
         nval = max(1, len(ds) // 10)
         tr, va = torch.utils.data.random_split(ds, [len(ds) - nval, nval])
     else:
-        chunks = raw_chunks(a.pop909, a.seq_beats, a.hop)
+        chunks = raw_chunks(a.pop909, a.seq_beats, a.hop, normalize=not a.no_normalize)
         random.Random(0).shuffle(chunks)
         nval = max(1, len(chunks) // 10)
-        va = ChunkData(chunks[:nval], augment=False)             # honest val: original key
-        tr = ChunkData(chunks[nval:], augment=not a.no_augment)  # key-augmented train
+        va = ChunkData(chunks[:nval], aug_range=0)            # honest val: no augmentation
+        tr = ChunkData(chunks[nval:], aug_range=a.aug_range)  # light +/- aug for robustness
 
     tdl = DataLoader(tr, a.batch, shuffle=True, collate_fn=collate, drop_last=True)
     vdl = DataLoader(va, a.batch, collate_fn=collate)
@@ -240,7 +275,7 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=a.lr, epochs=a.epochs, steps_per_epoch=len(tdl), pct_start=0.1)
     print(f"device={dev} params={sum(p.numel() for p in model.parameters()):,} "
-          f"train={len(tr)} val={len(va)} augment={not a.no_augment}")
+          f"train={len(tr)} val={len(va)} normalize={not a.no_normalize} aug_range={a.aug_range}")
 
     best = 0.0
     for ep in range(a.epochs):
